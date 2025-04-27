@@ -25,7 +25,6 @@ from google.genai import types
 # Constants
 BATCH_SIZE = 1
 URLS_FILE = "urls.txt"
-PINS_DIR = "pins"
 DATA_DIR = "data"
 PINS_PER_URL = 25  # Reduce number of pins per URL for GitHub Actions
 
@@ -143,7 +142,7 @@ def generate_image_with_gemini(prompt, file_name):
         return None, None, None
 
 def generate_pin_content(url, pins_per_url=5):
-    """Generate Pinterest pin content using Gemma model"""
+    """Generate Pinterest pin content using Gemma model with streaming"""
     try:
         model = "gemma-3-27b-it"  # Using Gemma model
         contents = [types.Content(
@@ -173,19 +172,27 @@ def generate_pin_content(url, pins_per_url=5):
         )
 
         print(f"Generating pin content with Gemma model for URL: {url}")
-        response = genai_client.models.generate_content(
+        
+        # Using streaming response
+        full_response = ""
+        print("Streaming response:")
+        for chunk in genai_client.models.generate_content_stream(
             model=model,
             contents=contents,
             config=generate_content_config
-        )
-
-        return response.text if response.text else "No content generated"
+        ):
+            if chunk.text:
+                print(chunk.text, end="", flush=True)
+                full_response += chunk.text
+        
+        print("\nPin content generation complete.")
+        return full_response if full_response else "No content generated"
     except Exception as e:
         print(f"Error generating pin content: {str(e)}")
         return f"Error: {str(e)}"
 
 def generate_board_category(title, keywords):
-    """Generate Pinterest board category using Gemma model"""
+    """Generate Pinterest board category using Gemma model with streaming"""
     try:
         model = "gemma-3-27b-it"
         contents = [types.Content(
@@ -217,13 +224,17 @@ def generate_board_category(title, keywords):
             response_mime_type="text/plain",
         )
 
-        response = genai_client.models.generate_content(
+        # Using streaming response
+        full_response = ""
+        for chunk in genai_client.models.generate_content_stream(
             model=model,
             contents=contents,
             config=generate_content_config
-        )
+        ):
+            if chunk.text:
+                full_response += chunk.text
 
-        board_name = response.text.strip().lower()
+        board_name = full_response.strip().lower()
 
         # Clean up the board name
         board_name = re.sub(r'[^a-z0-9\s-]', '', board_name)
@@ -371,23 +382,6 @@ def create_run_id():
     """Create a unique ID for this run based on timestamp"""
     return datetime.now().strftime('%Y%m%d_%H%M%S')
 
-def copy_image_to_repo(source_path, url, board_name, title):
-    """Copy generated image to repository directory structure"""
-    domain = get_domain_from_url(url)
-    slug = create_slug(title)[:40]  # Limit length
-    
-    # Create directory structure: pins/domain/board_name/
-    target_dir = os.path.join(PINS_DIR, domain, board_name)
-    ensure_directory_exists(target_dir)
-    
-    # Define target path
-    file_ext = os.path.splitext(source_path)[1]
-    target_path = os.path.join(target_dir, f"{slug}{file_ext}")
-    
-    # Copy the file
-    shutil.copy2(source_path, target_path)
-    return target_path
-
 def main():
     print("Pinterest Pin Maker - GitHub Actions Version")
     print("------------------------------------------")
@@ -396,7 +390,6 @@ def main():
     run_id = create_run_id()
     
     # Ensure required directories exist
-    ensure_directory_exists(PINS_DIR)
     ensure_directory_exists(DATA_DIR)
     
     # Ensure required files exist
@@ -433,7 +426,7 @@ def main():
         print(f"\nProcessing URL {i+1}/{len(batch_urls)}: {url}")
 
         try:
-            # Generate pin content
+            # Generate pin content with streaming
             print("Generating pin content with Gemma model...")
             csv_content = generate_pin_content(url, PINS_PER_URL)
 
@@ -471,13 +464,12 @@ def main():
                 # Generate image with Gemini
                 file_name = f"pin_{i+1}_{j+1}"
                 image_url = None
-                repo_image_path = None
 
                 try:
                     image_data, image_mime_type, image_file_path = generate_image_with_gemini(image_prompt, file_name)
 
                     if image_file_path and os.path.exists(image_file_path):
-                        # Generate board name first (needed for repository path)
+                        # Generate board name first
                         cache_key = pin['Title'][:15].lower()  # Use first part of title as cache key
                         if cache_key in board_cache:
                             board_name = board_cache[cache_key]
@@ -488,10 +480,6 @@ def main():
                             board_cache[cache_key] = board_name
                             print(f"Generated board name: {board_name}")
                         
-                        # Copy image to repository structure
-                        repo_image_path = copy_image_to_repo(image_file_path, url, board_name, pin['Title'])
-                        print(f"Copied image to repository: {repo_image_path}")
-                        
                         # Upload to Cloudinary
                         print("Uploading to Cloudinary...")
                         image_url = upload_to_cloudinary(image_file_path)
@@ -499,7 +487,6 @@ def main():
                         if image_url:
                             generated_images.append({
                                 'file_path': image_file_path,
-                                'repo_path': repo_image_path,
                                 'url': image_url,
                                 'title': pin['Title']
                             })
@@ -575,6 +562,12 @@ def main():
                     zipf.write(image['file_path'])
 
         print(f"\nImages zipped to {zip_filename}")
+        
+        # Clean up image files after zipping
+        for image in generated_images:
+            if os.path.exists(image['file_path']):
+                os.remove(image['file_path'])
+                print(f"Removed temporary image file: {image['file_path']}")
 
     # Write remaining URLs back to file
     write_urls(URLS_FILE, remaining_urls)
