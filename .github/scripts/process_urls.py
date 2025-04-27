@@ -23,10 +23,10 @@ from google import genai
 from google.genai import types
 
 # Constants
-BATCH_SIZE = 15
+BATCH_SIZE = 20
 URLS_FILE = "urls.txt"
 DATA_DIR = "data"
-PINS_PER_URL = 30  # Reduce number of pins per URL for GitHub Actions
+PINS_PER_URL = 25  # Reduce number of pins per URL for GitHub Actions
 
 # Email configuration
 TO_EMAIL = "beacleaner0@gmail.com"
