@@ -1,5 +1,5 @@
 pandas
 pillow
-google-generativeai
+google-genai
 pyyaml
 requests
