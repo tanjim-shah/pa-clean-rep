@@ -2134,9 +2134,7 @@ BATCH_SIZE = 5
 URLS_FILE = "urls.txt"
 PINS_DIR = "pins"
 DATA_DIR = "data"
-LOGS_DIR = "logs"
-PINS_PER_URL = 25  # Number of pins per URL
-API_LOG_FILE = os.path.join(LOGS_DIR, "api_usage_log.json")
+PINS_PER_URL = 25  # Reduce number of pins per URL for GitHub Actions
 
 # Email configuration
 TO_EMAIL = "beacleaner0@gmail.com"
@@ -2169,85 +2167,39 @@ def get_api_keys():
     print(f"Found {len(keys)} Gemini API keys")
     return keys
 
-# Create API key manager class with enhanced tracking
+# Create API key manager class
 class APIKeyManager:
     def __init__(self, api_keys):
         self.api_keys = api_keys
+        self.key_ids = [f"Key {i+1}" for i in range(len(api_keys))]
         self.current_index = 0
-        self.clients = {}
-        self.invalid_keys = set()
-        self.usage_log = {}  # Track usage per key
-        self.error_log = {}  # Track errors per key
-        
-        # Initialize clients for each API key
-        for key in self.api_keys:
-            try:
-                self.clients[key] = genai.Client(api_key=key)
-                self.usage_log[key] = {'success': 0, 'failures': 0}
-                self.error_log[key] = []
-            except Exception as e:
-                print(f"Invalid API key detected: {key[:4]}...{key[-4:]} - {str(e)}")
-                self.invalid_keys.add(key)
+        self.clients = {self.key_ids[i]: genai.Client(api_key=key) for i, key in enumerate(self.api_keys)}
     
     def get_client(self):
-        """Get the current client"""
-        key = self.api_keys[self.current_index]
-        if key in self.invalid_keys:
-            self.rotate_key()
-            return self.get_client()
-        return self.clients[key]
+        """Get the current client and its key ID"""
+        key_id = self.key_ids[self.current_index]
+        return self.clients[key_id], key_id
+    
+    def get_current_key_id(self):
+        """Get the current key identifier"""
+        return self.key_ids[self.current_index]
     
     def rotate_key(self):
-        """Rotate to the next valid API key"""
-        initial_index = self.current_index
-        while True:
-            self.current_index = (self.current_index + 1) % len(self.api_keys)
-            key = self.api_keys[self.current_index]
-            if key not in self.invalid_keys:
-                print(f"Rotated to API key {self.current_index + 1}/{len(self.api_keys)}")
-                return self.clients[key]
-            if self.current_index == initial_index:
-                raise ValueError("All API keys are invalid or exhausted")
-    
-    def get_random_client(self):
-        """Get a random valid client to distribute load"""
-        valid_keys = [k for k in self.api_keys if k not in self.invalid_keys]
-        if not valid_keys:
-            raise ValueError("No valid API keys available")
-        self.current_index = self.api_keys.index(random.choice(valid_keys))
+        """Rotate to the next API key"""
+        self.current_index = (self.current_index + 1) % len(self.api_keys)
+        key_id = self.key_ids[self.current_index]
+        print(f"Rotated to {key_id}")
         return self.get_client()
     
-    def log_usage(self, key, success=True, error=None):
-        """Log API key usage and errors"""
-        if success:
-            self.usage_log[key]['success'] += 1
-        else:
-            self.usage_log[key]['failures'] += 1
-            if error:
-                self.error_log[key].append(str(error))
-    
-    def save_logs(self):
-        """Save API usage and error logs to a file"""
-        ensure_directory_exists(LOGS_DIR)
-        log_data = {
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%m:%S'),
-            'usage': self.usage_log,
-            'errors': self.error_log
-        }
-        with open(API_LOG_FILE, 'w') as f:
-            json.dump(log_data, f, indent=2)
-    
-    def get_usage_summary(self):
-        """Generate a summary of API key usage for email notification"""
-        summary = ["API Key Usage Summary:"]
-        for key in self.api_keys:
-            usage = self.usage_log.get(key, {'success': 0, 'failures': 0})
-            errors = self.error_log.get(key, [])
-            status = "Invalid" if key in self.invalid_keys else "Valid"
-            summary.append(f"Key {key[:4]}...{key[-4:]} ({status}): {usage['success']} successes, {usage['failures']} failures")
-            if errors:
-                summary.append(f"  Errors: {', '.join(errors[:3])}" + (f" (+{len(errors)-3} more)" if len(errors) > 3 else ""))
-        return "\n".join(summary)
+    def get_random_client(self):
+        """Get a random client to distribute load"""
+        self.current_index = random.randint(0, len(self.api_keys) - 1)
+        key_id = self.key_ids[self.current_index]
+        return self.clients[key_id], key_id
+
+# Initialize API key manager with all available keys
+api_keys = get_api_keys()
+key_manager = APIKeyManager(api_keys)
 
 def ensure_directory_exists(directory):
     """Ensure a directory exists, creating it if needed"""
@@ -2320,10 +2272,9 @@ def upload_to_cloudinary(file_path, resource_type="image"):
 def generate_image_with_gemini(prompt, file_name, max_retries=3):
     """Generate an image using Gemini 2.0 Flash image generation model with retry logic"""
     for attempt in range(max_retries):
+        client, key_id = key_manager.get_client()
+        print(f"Attempt {attempt+1}/{max_retries} with {key_id} for image generation")
         try:
-            client = key_manager.get_random_client()
-            current_key = key_manager.api_keys[key_manager.current_index]
-            
             model = "gemini-2.0-flash-exp-image-generation"
             contents = [types.Content(
                 role="user",
@@ -2336,7 +2287,6 @@ def generate_image_with_gemini(prompt, file_name, max_retries=3):
                 config=types.GenerateContentConfig(response_modalities=["image", "text"])
             )
 
-            # Process response to extract image
             if response.candidates and response.candidates[0].content.parts:
                 for part in response.candidates[0].content.parts:
                     if hasattr(part, 'inline_data') and part.inline_data:
@@ -2344,64 +2294,44 @@ def generate_image_with_gemini(prompt, file_name, max_retries=3):
                         file_ext = mimetypes.guess_extension(inline_data.mime_type) or ".png"
                         file_path = f"{file_name}{file_ext}"
 
-                        # Save the file
                         save_binary_file(file_path, inline_data.data)
-
-                        # Compress and convert to WebP
                         final_path = compress_image(file_path)
-
-                        print(f"Image generated and saved to: {final_path}")
-                        key_manager.log_usage(current_key, success=True)
-                        return inline_data.data, inline_data.mime_type, final_path, current_key
+                        print(f"Successfully generated image with {key_id} and saved to: {final_path}")
+                        return inline_data.data, inline_data.mime_type, final_path
 
             raise Exception("No image data found in response")
             
         except Exception as e:
-            print(f"Error generating image (attempt {attempt+1}/{max_retries}): {str(e)}")
-            key_manager.log_usage(current_key, success=False, error=str(e))
+            print(f"Failed with {key_id}: {str(e)}")
             if attempt < max_retries - 1:
-                print(f"Retrying with different API key...")
-                time.sleep(2 ** attempt)  # Exponential backoff
+                key_manager.rotate_key()
+                time.sleep(2)
             else:
                 print("All retries failed")
-                return None, None, None, current_key
+                return None, None, None
 
 def call_gemini_with_retry(model, contents, config, max_retries=3):
     """Call Gemini API with retry logic for rate limits"""
     for attempt in range(max_retries):
+        client, key_id = key_manager.get_client()
+        print(f"Attempt {attempt+1}/{max_retries} with {key_id} for content generation")
         try:
-            client = key_manager.get_client()
-            current_key = key_manager.api_keys[key_manager.current_index]
-            
             response = client.models.generate_content(
                 model=model,
                 contents=contents,
                 config=config
             )
-            key_manager.log_usage(current_key, success=True)
-            return response, current_key
-            
+            print(f"Successfully generated content with {key_id}")
+            return response
         except Exception as e:
             error_str = str(e).lower()
-            print(f"API error (attempt {attempt+1}/{max_retries}): {error_str}")
-            key_manager.log_usage(current_key, success=False, error=error_str)
-            
-            # Check for rate limit or invalid key errors
+            print(f"Failed with {key_id}: {error_str}")
             if "rate limit" in error_str or "quota" in error_str or "429" in error_str:
                 if attempt < max_retries - 1:
-                    print(f"Rate limit hit. Rotating API key and retrying...")
                     key_manager.rotate_key()
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2)
                 else:
                     print("All API keys are rate limited. Giving up.")
-                    raise
-            elif "invalid" in error_str or "permission" in error_str or "authentication" in error_str:
-                print(f"Invalid API key detected: {current_key[:4]}...{current_key[-4:]}")
-                key_manager.invalid_keys.add(current_key)
-                key_manager.rotate_key()
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
                     raise
             else:
                 raise
@@ -2409,7 +2339,7 @@ def call_gemini_with_retry(model, contents, config, max_retries=3):
 def generate_pin_content(url, pins_per_url=5, max_retries=3):
     """Generate Pinterest pin content using Gemma model with retry logic"""
     try:
-        model = "gemma-3-27b-it"  # Using Gemma model
+        model = "gemma-3-27b-it"
         contents = [types.Content(
             role="user",
             parts=[types.Part.from_text(text=f"""
@@ -2439,14 +2369,12 @@ def generate_pin_content(url, pins_per_url=5, max_retries=3):
         )
 
         print(f"Generating pin content with Gemma model for URL: {url}")
+        response = call_gemini_with_retry(model, contents, generate_content_config, max_retries)
         
-        # Call with retry logic
-        response, used_key = call_gemini_with_retry(model, contents, generate_content_config, max_retries)
-        
-        return response.text if response.text else "No content generated", used_key
+        return response.text if response.text else "No content generated"
     except Exception as e:
         print(f"Error generating pin content: {str(e)}")
-        return f"Error: {str(e)}", None
+        return f"Error: {str(e)}"
 
 def generate_board_category(title, keywords, max_retries=3):
     """Generate Pinterest board category using Gemma model with retry logic"""
@@ -2474,66 +2402,54 @@ def generate_board_category(title, keywords, max_retries=3):
         )]
 
         generate_content_config = types.GenerateContentConfig(
-            temperature=0.2,  # Lower temperature for more consistent results
+            temperature=0.2,
             top_p=0.95,
             top_k=40,
-            max_output_tokens=20,  # Short response
+            max_output_tokens=20,
             response_mime_type="text/plain",
         )
 
-        # Call with retry logic
-        response, used_key = call_gemini_with_retry(model, contents, generate_content_config, max_retries)
+        response = call_gemini_with_retry(model, contents, generate_content_config, max_retries)
 
         board_name = response.text.strip().lower()
-
-        # Clean up the board name
         board_name = re.sub(r'[^a-z0-9\s-]', '', board_name)
         board_name = re.sub(r'[\s]+', '-', board_name)
         board_name = board_name.strip('-')
 
-        # Fallback if the model returns something invalid
         if not board_name or len(board_name) < 3:
-            return "home-inspiration", used_key
-
-        return board_name, used_key
+            return "home-inspiration"
+        return board_name
     except Exception as e:
         print(f"Error generating board category: {str(e)}")
-        return "home-inspiration", None
+        return "home-inspiration"
 
 def parse_csv_content(csv_content):
     """Parse CSV content from API response using a more robust approach"""
     pins = []
     
     try:
-        # First attempt to use StringIO and csv reader for proper CSV parsing
         csv_file = StringIO(csv_content.strip())
         reader = csv.reader(csv_file)
-        
         rows = list(reader)
         
-        # Skip header if present
         start_idx = 0
         if rows and len(rows) > 0:
             if 'Title' in rows[0][0] and 'Description' in ''.join(rows[0]):
                 start_idx = 1
                 
-        # Process each row
         for i in range(start_idx, len(rows)):
             row = rows[i]
             if not row or not ''.join(row).strip():
                 continue
                 
-            # Ensure we have at least 3 columns
             if len(row) >= 3:
                 title = row[0].strip()
                 description = row[1].strip()
                 keywords = row[2].strip()
                 
-                # Remove quotation marks from title and description
                 title = title.strip('"\'')
                 description = description.strip('"\'')
                 
-                # Validate data
                 if title and description and keywords:
                     pins.append({
                         'Title': title,
@@ -2542,50 +2458,41 @@ def parse_csv_content(csv_content):
                     })
                     
     except Exception as e:
-        print(f"Error parsing CSV with reader: {e}")
-        # Fallback to manual parsing if CSV reader fails
+        print(f"Error parsing CSV with reader: {str(e)}")
         try:
             lines = csv_content.strip().split('\n')
-            
-            # Skip header if present
             start_idx = 0
             if 'Title' in lines[0] and 'Description' in lines[0]:
                 start_idx = 1
             
-            # Process each line
             for i in range(start_idx, len(lines)):
                 line = lines[i]
                 if not line.strip():
                     continue
                 
-                try:
-                    # Handle potential CSV formatting issues
-                    if ',' in line:
-                        parts = line.split(',')
-                        if len(parts) >= 3:
-                            title = parts[0].strip()
-                            description = ','.join(parts[1:-1]).strip()  # Join all middle parts in case descriptions have commas
-                            keywords = parts[-1].strip()
-                            
-                            # Remove quotation marks from title and description
-                            title = title.strip('"\'')
-                            description = description.strip('"\'')
-                            
-                            if title and description and keywords:
-                                pins.append({
-                                    'Title': title,
-                                    'Description': description,
-                                    'Keywords': keywords
-                                })
-                except Exception as e:
-                    print(f"Error parsing line: {line}, Error: {str(e)}")
+                if ',' in line:
+                    parts = line.split(',')
+                    if len(parts) >= 3:
+                        title = parts[0].strip()
+                        description = ','.join(parts[1:-1]).strip()
+                        keywords = parts[-1].strip()
+                        
+                        title = title.strip('"\'')
+                        description = description.strip('"\'')
+                        
+                        if title and description and keywords:
+                            pins.append({
+                                'Title': title,
+                                'Description': description,
+                                'Keywords': keywords
+                            })
         except Exception as e:
             print(f"Error in fallback parsing: {str(e)}")
 
     return pins
 
-def send_email_notification(to_email, from_email, app_password, csv_data, api_summary, subject="Pinterest Pin Generation Complete"):
-    """Send email with CSV attachment and API usage summary"""
+def send_email_notification(to_email, from_email, app_password, csv_data, subject="Pinterest Pin Generation Complete"):
+    """Send email with CSV attachment"""
     if not app_password:
         print("No email password provided. Skipping email notification.")
         return False
@@ -2595,7 +2502,6 @@ def send_email_notification(to_email, from_email, app_password, csv_data, api_su
     msg['To'] = to_email
     msg['Subject'] = f"{subject} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
-    # Email body
     body = f"""
     Hello,
 
@@ -2603,13 +2509,10 @@ def send_email_notification(to_email, from_email, app_password, csv_data, api_su
     The CSV file with the generated pins is attached.
 
     Time of completion: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    
-    {api_summary}
     """
 
     msg.attach(MIMEText(body, 'plain'))
 
-    # Attach CSV - ensure it's bytes
     if isinstance(csv_data, StringIO):
         attachment_data = csv_data.getvalue().encode('utf-8')
     else:
@@ -2619,7 +2522,6 @@ def send_email_notification(to_email, from_email, app_password, csv_data, api_su
     csv_attachment['Content-Disposition'] = 'attachment; filename="pinterest_pins.csv"'
     msg.attach(csv_attachment)
 
-    # Send email
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
@@ -2635,19 +2537,15 @@ def send_email_notification(to_email, from_email, app_password, csv_data, api_su
 def create_slug(text):
     """Generate SEO-friendly slug from text"""
     slug = text.lower()
-    # Remove special characters and replace spaces with hyphens
     slug = re.sub(r'[^a-z0-9\s-]', '', slug)
     slug = re.sub(r'[\s-]+', '-', slug)
-    slug = slug.strip('-')  # Remove leading/trailing hyphens
-    slug = slug[:100]  # Limit length
+    slug = slug.strip('-')
+    slug = slug[:100]
     return slug
 
 def extract_topic_from_url(url):
     """Extract topic from URL for image generation prompt"""
-    # Extract path from URL
     path = url.split('/')
-
-    # Find the part that's likely the article title
     article_segment = None
     for segment in path:
         if segment and segment not in ['http:', 'https:', '', 'www', 'com', 'org', 'net']:
@@ -2656,11 +2554,8 @@ def extract_topic_from_url(url):
                 break
 
     if article_segment:
-        # Convert hyphens to spaces and clean up
         topic = article_segment.replace('-', ' ').replace('_', ' ').title()
         return topic
-
-    # Fallback
     return "Home Decor"
 
 def get_domain_from_url(url):
@@ -2668,7 +2563,6 @@ def get_domain_from_url(url):
     try:
         from urllib.parse import urlparse
         domain = urlparse(url).netloc
-        # Remove www. prefix if present
         if domain.startswith('www.'):
             domain = domain[4:]
         return domain
@@ -2682,102 +2576,78 @@ def create_run_id():
 def copy_image_to_repo(source_path, url, board_name, title):
     """Copy generated image to repository directory structure"""
     domain = get_domain_from_url(url)
-    slug = create_slug(title)[:40]  # Limit length
+    slug = create_slug(title)[:40]
     
-    # Create directory structure: pins/domain/board_name/
     target_dir = os.path.join(PINS_DIR, domain, board_name)
     ensure_directory_exists(target_dir)
     
-    # Define target path
     file_ext = os.path.splitext(source_path)[1]
     target_path = os.path.join(target_dir, f"{slug}{file_ext}")
     
-    # Copy the file
     shutil.copy2(source_path, target_path)
     return target_path
 
 def extract_keywords_for_extra_field(keywords_str):
     """Extract keywords for the extra 'Keywords' column"""
-    # Split the keywords by commas
     keywords_list = [k.strip() for k in keywords_str.split(',')]
-    
-    # Join with commas and return
     return ', '.join(keywords_list)
 
 def main():
     print("Pinterest Pin Maker - GitHub Actions Version")
     print("------------------------------------------")
     
-    # Create run ID for this batch
     run_id = create_run_id()
     
-    # Ensure required directories exist
     ensure_directory_exists(PINS_DIR)
     ensure_directory_exists(DATA_DIR)
-    ensure_directory_exists(LOGS_DIR)
-    
-    # Ensure required files exist
     ensure_file_exists(URLS_FILE)
     
-    # Read URLs 
     all_urls = read_urls(URLS_FILE)
     
     if not all_urls:
         print("No URLs found to process.")
         return
     
-    # Take the next batch of URLs
     batch_urls = all_urls[:BATCH_SIZE]
     remaining_urls = all_urls[BATCH_SIZE:]
     print(f"Processing batch of {len(batch_urls)} URLs")
     print(f"Using {len(api_keys)} Gemini API keys for load balancing")
     
-    # Create CSV file for this batch
     batch_csv_path = os.path.join(DATA_DIR, f"pinterest_pins_{run_id}.csv")
     
-    # Initialize CSV output with additional column for API key
     csv_output = StringIO()
     csv_writer = csv.writer(csv_output, quoting=csv.QUOTE_MINIMAL)
-    csv_writer.writerow(['Title', 'Media URL', 'Pinterest board', 'Thumbnail', 'Link', 'Publish date', 'Description', 'Keywords', 'API Key'])
+    csv_writer.writerow(['Title', 'Media URL', 'Pinterest board', 'Thumbnail', 'Link', 'Publish date', 'Description', 'Keywords'])
 
-    # Storage for generated images
     generated_images = []
-
-    # Cache for board names to reduce API calls
     board_cache = {}
-    
-    # Process each URL in the batch
+    api_usage_count = {key: 0 for key in api_keys}
+
     for i, url in enumerate(batch_urls):
         print(f"\nProcessing URL {i+1}/{len(batch_urls)}: {url}")
         domain_name = get_domain_from_url(url)
 
         try:
-            # Generate pin content
             print("Generating pin content with Gemma model...")
-            csv_content, content_key = generate_pin_content(url, PINS_PER_URL)
+            csv_content = generate_pin_content(url, PINS_PER_URL)
 
             if csv_content.startswith("Error"):
                 print(f"Error generating pin content: {csv_content}")
                 continue
 
-            # Parse the generated content
             pins = parse_csv_content(csv_content)
             print(f"Generated {len(pins)} pin ideas")
 
-            # Extract topic from URL
             topic = extract_topic_from_url(url)
             print(f"Extracted topic: {topic}")
 
-            # Create images and upload to Cloudinary for each pin
             for j, pin in enumerate(pins):
                 print(f"Creating image {j+1}/{len(pins)}...")
 
-                # Validate pin data
                 if not pin.get('Title') or not pin.get('Description') or not pin.get('Keywords'):
                     print(f"Skipping pin with incomplete data: {pin}")
                     continue
 
-                # Generate image prompt based on pin title and URL topic
                 image_prompt = f"""
                 Create a visually appealing Pinterest pin image for the title: "{pin['Title']}"
 
@@ -2792,33 +2662,30 @@ def main():
                 - Include visual elements related to {topic}
                 """
 
-                # Generate image with Gemini - distribute among API keys
                 file_name = f"pin_{i+1}_{j+1}"
                 image_url = None
                 repo_image_path = None
-                image_key = None
 
                 try:
-                    image_data, image_mime_type, image_file_path, image_key = generate_image_with_gemini(image_prompt, file_name)
+                    key_manager.get_random_client()
+                    current_key_id = key_manager.get_current_key_id()
+                    print(f"Starting image generation for pin {j+1} with {current_key_id}")
+                    image_data, image_mime_type, image_file_path = generate_image_with_gemini(image_prompt, file_name)
 
                     if image_file_path and os.path.exists(image_file_path):
-                        # Generate board name first (needed for repository path)
-                        cache_key = pin['Title'][:15].lower()  # Use first part of title as cache key
+                        cache_key = pin['Title'][:15].lower()
                         if cache_key in board_cache:
                             board_name = board_cache[cache_key]
                             print(f"Using cached board name: {board_name}")
-                            board_key = None
                         else:
                             print("Generating board name with Gemma model...")
-                            board_name, board_key = generate_board_category(pin['Title'], pin['Keywords'])
+                            board_name = generate_board_category(pin['Title'], pin['Keywords'])
                             board_cache[cache_key] = board_name
                             print(f"Generated board name: {board_name}")
                         
-                        # Copy image to repository structure
                         repo_image_path = copy_image_to_repo(image_file_path, url, board_name, pin['Title'])
                         print(f"Copied image to repository: {repo_image_path}")
                         
-                        # Upload to Cloudinary
                         print("Uploading to Cloudinary...")
                         image_url = upload_to_cloudinary(image_file_path)
 
@@ -2834,94 +2701,62 @@ def main():
 
                 except Exception as e:
                     print(f"Error generating/uploading image: {str(e)}")
-                    # Use a placeholder image URL if image generation fails
                     image_url = "https://res.cloudinary.com/dbcpfy04c/image/upload/v1618237451/placeholder.jpg"
-                    board_name = "home-inspiration"  # Default fallback
-                    image_key = image_key or "N/A"
+                    board_name = "home-inspiration"
 
-                # Generate a unique UTM campaign parameter based on pin title
-                utm_campaign = create_slug(pin['Title'])[:20]  # Limit length for URL compatibility
-
-                # Create the tracked URL with UTM parameters
+                utm_campaign = create_slug(pin['Title'])[:20]
                 tracked_url = url
                 if '?' in tracked_url:
                     tracked_url += f"&utm_source=pinterest&utm_campaign={utm_campaign}"
                 else:
                     tracked_url += f"?utm_source=pinterest&utm_campaign={utm_campaign}"
 
-                # Extract keywords for the extra field
                 extra_keywords = extract_keywords_for_extra_field(pin['Keywords'])
-                
-                # Format the current date
                 current_date = datetime.now().strftime('%Y-%m-%d')
                 
-                # Use the image_key for the API Key column
-                api_key_display = f"{image_key[:4]}...{image_key[-4:]}" if image_key and image_key != "N/A" else "N/A"
-                
-                # Add to CSV with proper quoting to avoid field delimiter issues
                 csv_writer.writerow([
-                    pin['Title'],                        # Title
-                    image_url if image_url else "https://res.cloudinary.com/dbcpfy04c/image/upload/v1618237451/placeholder.jpg", # Media URL
-                    board_name,                          # Pinterest board
-                    '',                                  # Thumbnail (empty)
-                    tracked_url,                         # Link (with UTM parameters)
-                    current_date,                        # Publish date
-                    pin['Description'],                  # Description
-                    pin['Keywords'],                     # Keywords
-                    api_key_display                      # API Key
+                    pin['Title'],
+                    image_url if image_url else "https://res.cloudinary.com/dbcpfy04c/image/upload/v1618237451/placeholder.jpg",
+                    board_name,
+                    '',
+                    tracked_url,
+                    current_date,
+                    pin['Description'],
+                    pin['Keywords']
                 ])
 
-                # Add a small delay to prevent rate limiting
                 time.sleep(2)
 
         except Exception as e:
             print(f"Error processing URL {url}: {str(e)}")
-            # Keep the URL in the list if there was an error
             remaining_urls.append(url)
 
-    # Save CSV file to repository
     with open(batch_csv_path, 'w', newline='', encoding='utf-8') as f:
         f.write(csv_output.getvalue())
     
-    # Create CSV file for all pins (append to existing or create new)
     all_pins_csv_path = os.path.join(DATA_DIR, "all_pinterest_pins.csv")
     if os.path.exists(all_pins_csv_path):
-        # Read existing data
         existing_df = pd.read_csv(all_pins_csv_path)
-        # Read new data
         csv_output.seek(0)
         new_df = pd.read_csv(csv_output)
-        # Combine and save
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
         combined_df.to_csv(all_pins_csv_path, index=False, quoting=csv.QUOTE_MINIMAL)
     else:
-        # Just save current batch as all pins
         csv_output.seek(0)
         with open(all_pins_csv_path, 'w', newline='', encoding='utf-8') as f:
             f.write(csv_output.getvalue())
     
-    # Create zip archive of all generated images
     if generated_images:
         timestamp = int(time.time())
         zip_filename = f"pinterest_images_{timestamp}.zip"
-
         with zipfile.ZipFile(zip_filename, 'w') as zipf:
             for image in generated_images:
                 if os.path.exists(image['file_path']):
                     zipf.write(image['file_path'])
-
         print(f"\nImages zipped to {zip_filename}")
 
-    # Write remaining URLs back to file
     write_urls(URLS_FILE, remaining_urls)
     
-    # Save API usage logs
-    key_manager.save_logs()
-    
-    # Generate API usage summary for email
-    api_summary = key_manager.get_usage_summary()
-    
-    # Send email notification
     print("Sending email notification...")
     csv_output.seek(0)
     send_email_notification(
@@ -2929,14 +2764,12 @@ def main():
         FROM_EMAIL,
         APP_PASSWORD,
         csv_output,
-        api_summary,
         f"Pinterest Pin Generation - Batch of {len(batch_urls)} URLs"
     )
     
     print("\nProcess completed successfully!")
     print(f"Processed {len(batch_urls)} URLs, {len(remaining_urls)} URLs remaining")
     
-    # Set output for GitHub Actions
     with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as f:
         f.write(f"processed_urls={len(batch_urls)}\n")
         f.write(f"remaining_urls={len(remaining_urls)}\n")
